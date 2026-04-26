@@ -13,9 +13,8 @@ type RepositorySlug = {
   name: string;
 };
 
-function readFileInBase64(path: string): string {
-  return fs.readFileSync(path, { encoding: "base64" });
-}
+// Passed from prepare → success so we tag the API-created commit
+let preparedCommitSha: string | undefined;
 
 function getOctokit(token: string) {
   return new ThrottlingOctokit({
@@ -43,19 +42,17 @@ function unsafeParseString(value: string | undefined): string {
   if (typeof value === "string") {
     return value;
   }
-  throw new Error("TODO: write an error message");
+  throw new Error("Expected a string value but received undefined");
 }
 
 function unsafeParseRepositorySlug(repositoryUrl: string): RepositorySlug {
   const maybeRepositoryUrl = parseRepositoryUrl(repositoryUrl);
   if (maybeRepositoryUrl === false) {
-    throw new Error("TODO: write an error message");
+    throw new Error(`Could not parse repository URL: ${repositoryUrl}`);
   }
   return { owner: maybeRepositoryUrl[0], name: maybeRepositoryUrl[1] };
 }
 
-// The type PluginSpec is misleading here, `semantic-release --dry-run`
-// indicates this value is an object.
 function unsafeParseAssets(pluginConfig: unknown): string[] {
   if (typeof pluginConfig === "string") {
     throw new Error(`Expected plugin config to specify 'assets'`);
@@ -81,8 +78,6 @@ function verifyConditions(pluginConfig: PluginSpec, context: Context) {
   unsafeParseRepositorySlug(repositoryUrl);
   unsafeParseString(context.env["GITHUB_TOKEN"]);
   unsafeParseAssets(pluginConfig);
-  // TODO: test if github token has the right permissions, like
-  // @semantic-release/git does
 }
 
 async function prepare(pluginConfig: PluginSpec, context: Context) {
@@ -99,28 +94,121 @@ async function prepare(pluginConfig: PluginSpec, context: Context) {
       `Did not expect 'prepare' to be invoked with undefined 'nextRelease'`
     );
   }
-  // This is the default commit message from @semantic-release/git
+
   const message = `chore(release): ${nextRelease.version} [skip ci]\n\n${nextRelease.notes}`;
 
-  for (const path of assets) {
-    const content = readFileInBase64(path);
-    const sha = execSync(`git rev-parse ${branch}:${path}`, {
-      encoding: "utf8",
-    }).trim();
+  // Get the current HEAD commit of the branch
+  const refData = await octokit.rest.git.getRef({
+    owner: slug.owner,
+    repo: slug.name,
+    ref: `heads/${branch}`,
+  });
+  const headCommitSha = refData.data.object.sha;
 
-    await octokit.rest.repos.createOrUpdateFileContents({
-      owner: slug.owner,
-      repo: slug.name,
-      path,
-      message,
-      branch,
-      content,
-      sha,
-    });
+  // Get the base tree SHA from that commit
+  const commitData = await octokit.rest.git.getCommit({
+    owner: slug.owner,
+    repo: slug.name,
+    commit_sha: headCommitSha,
+  });
+  const baseTreeSha = commitData.data.tree.sha;
+
+  // Create blobs for all assets in parallel
+  const treeItems = await Promise.all(
+    assets.map(async (assetPath) => {
+      const content = fs.readFileSync(assetPath, { encoding: "utf-8" });
+      const blobData = await octokit.rest.git.createBlob({
+        owner: slug.owner,
+        repo: slug.name,
+        content,
+        encoding: "utf-8",
+      });
+      return {
+        path: assetPath,
+        mode: "100644" as const,
+        type: "blob" as const,
+        sha: blobData.data.sha,
+      };
+    })
+  );
+
+  // Create a single tree with all changed files
+  const treeData = await octokit.rest.git.createTree({
+    owner: slug.owner,
+    repo: slug.name,
+    base_tree: baseTreeSha,
+    tree: treeItems,
+  });
+
+  // Create the commit (GitHub signs it automatically for app/bot tokens)
+  const newCommitData = await octokit.rest.git.createCommit({
+    owner: slug.owner,
+    repo: slug.name,
+    message,
+    tree: treeData.data.sha,
+    parents: [headCommitSha],
+  });
+
+  preparedCommitSha = newCommitData.data.sha;
+
+  // Advance the branch ref
+  await octokit.rest.git.updateRef({
+    owner: slug.owner,
+    repo: slug.name,
+    ref: `heads/${branch}`,
+    sha: preparedCommitSha,
+  });
+
+  // Sync local state so semantic-release's git tag points to the new commit
+  execSync("git fetch origin", { stdio: "inherit" });
+  execSync(`git reset --hard origin/${branch}`, { stdio: "inherit" });
+}
+
+async function success(_pluginConfig: PluginSpec, context: Context) {
+  if (preparedCommitSha === undefined) {
+    return;
   }
+
+  const nextRelease = context.nextRelease;
+  if (nextRelease === undefined) {
+    return;
+  }
+
+  const repositoryUrl = unsafeParseString(context.options?.repositoryUrl);
+  const slug = unsafeParseRepositorySlug(repositoryUrl);
+  const githubToken = unsafeParseString(context.env["GITHUB_TOKEN"]);
+  const octokit = getOctokit(githubToken);
+
+  const tagName = nextRelease.gitTag;
+
+  // Remove the unsigned CLI-created tag
+  await octokit.rest.git.deleteRef({
+    owner: slug.owner,
+    repo: slug.name,
+    ref: `tags/${tagName}`,
+  });
+
+  // Create an annotated tag object via API (GitHub auto-signs bot/app tokens)
+  const tagData = await octokit.rest.git.createTag({
+    owner: slug.owner,
+    repo: slug.name,
+    tag: tagName,
+    message: `chore(release): ${nextRelease.version}`,
+    object: preparedCommitSha,
+    type: "commit",
+  });
+
+  // Create the tag ref pointing to the new annotated tag object
+  await octokit.rest.git.createRef({
+    owner: slug.owner,
+    repo: slug.name,
+    ref: `refs/tags/${tagName}`,
+    sha: tagData.data.sha,
+  });
 }
 
 module.exports = {
   verifyConditions,
   prepare,
+  success,
 };
