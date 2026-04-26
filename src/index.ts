@@ -13,8 +13,6 @@ type RepositorySlug = {
   name: string;
 };
 
-// Passed from prepare → success so we tag the API-created commit
-let preparedCommitSha: string | undefined;
 
 function getOctokit(token: string) {
   return new ThrottlingOctokit({
@@ -149,7 +147,7 @@ async function prepare(pluginConfig: PluginSpec, context: Context) {
     parents: [headCommitSha],
   });
 
-  preparedCommitSha = newCommitData.data.sha;
+  const preparedCommitSha = newCommitData.data.sha;
 
   // Advance the branch ref
   await octokit.rest.git.updateRef({
@@ -164,51 +162,7 @@ async function prepare(pluginConfig: PluginSpec, context: Context) {
   execSync(`git reset --hard origin/${branch}`, { stdio: "inherit" });
 }
 
-async function success(_pluginConfig: PluginSpec, context: Context) {
-  if (preparedCommitSha === undefined) {
-    return;
-  }
-
-  const nextRelease = context.nextRelease;
-  if (nextRelease === undefined) {
-    return;
-  }
-
-  const repositoryUrl = unsafeParseString(context.options?.repositoryUrl);
-  const slug = unsafeParseRepositorySlug(repositoryUrl);
-  const githubToken = unsafeParseString(context.env["GITHUB_TOKEN"]);
-  const octokit = getOctokit(githubToken);
-
-  const tagName = nextRelease.gitTag;
-
-  // Remove the unsigned CLI-created tag
-  await octokit.rest.git.deleteRef({
-    owner: slug.owner,
-    repo: slug.name,
-    ref: `tags/${tagName}`,
-  });
-
-  // Create an annotated tag object via API (GitHub auto-signs bot/app tokens)
-  const tagData = await octokit.rest.git.createTag({
-    owner: slug.owner,
-    repo: slug.name,
-    tag: tagName,
-    message: `chore(release): ${nextRelease.version}`,
-    object: preparedCommitSha,
-    type: "commit",
-  });
-
-  // Create the tag ref pointing to the new annotated tag object
-  await octokit.rest.git.createRef({
-    owner: slug.owner,
-    repo: slug.name,
-    ref: `refs/tags/${tagName}`,
-    sha: tagData.data.sha,
-  });
-}
-
 module.exports = {
   verifyConditions,
   prepare,
-  success,
 };
